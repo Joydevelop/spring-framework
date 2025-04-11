@@ -27,6 +27,7 @@ import org.apache.commons.logging.LogFactory;
 import org.jspecify.annotations.Nullable;
 
 import org.springframework.aop.scope.ScopedProxyFactoryBean;
+import org.springframework.aot.AotDetector;
 import org.springframework.asm.Opcodes;
 import org.springframework.asm.Type;
 import org.springframework.beans.factory.BeanDefinitionStoreException;
@@ -112,12 +113,17 @@ class ConfigurationClassEnhancer {
 
 		try {
 			// Use original ClassLoader if config class not locally loaded in overriding class loader
-			if (classLoader instanceof SmartClassLoader smartClassLoader &&
-					classLoader != configClass.getClassLoader()) {
+			boolean classLoaderMismatch = (classLoader != null && classLoader != configClass.getClassLoader());
+			if (classLoaderMismatch && classLoader instanceof SmartClassLoader smartClassLoader) {
 				classLoader = smartClassLoader.getOriginalClassLoader();
+				classLoaderMismatch = (classLoader != configClass.getClassLoader());
+			}
+			// Use original ClassLoader if config class relies on package visibility
+			if (classLoaderMismatch && reliesOnPackageVisibility(configClass)) {
+				classLoader = configClass.getClassLoader();
+				classLoaderMismatch = false;
 			}
 			Enhancer enhancer = newEnhancer(configClass, classLoader);
-			boolean classLoaderMismatch = (classLoader != null && classLoader != configClass.getClassLoader());
 			Class<?> enhancedClass = createClass(enhancer, classLoaderMismatch);
 			if (logger.isTraceEnabled()) {
 				logger.trace(String.format("Successfully enhanced %s; enhanced class name is: %s",
@@ -133,30 +139,46 @@ class ConfigurationClassEnhancer {
 	}
 
 	/**
+	 * Checks whether the given config class relies on package visibility,
+	 * either for the class itself or for any of its {@code @Bean} methods.
+	 */
+	private boolean reliesOnPackageVisibility(Class<?> configSuperClass) {
+		int mod = configSuperClass.getModifiers();
+		if (!Modifier.isPublic(mod) && !Modifier.isProtected(mod)) {
+			return true;
+		}
+		for (Method method : ReflectionUtils.getDeclaredMethods(configSuperClass)) {
+			if (BeanAnnotationHelper.isBeanAnnotated(method)) {
+				mod = method.getModifiers();
+				if (!Modifier.isPublic(mod) && !Modifier.isProtected(mod)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Creates a new CGLIB {@link Enhancer} instance.
 	 */
 	private Enhancer newEnhancer(Class<?> configSuperClass, @Nullable ClassLoader classLoader) {
 		Enhancer enhancer = new Enhancer();
 		if (classLoader != null) {
 			enhancer.setClassLoader(classLoader);
+			if (classLoader instanceof SmartClassLoader smartClassLoader &&
+					smartClassLoader.isClassReloadable(configSuperClass)) {
+				enhancer.setUseCache(false);
+			}
 		}
 		enhancer.setSuperclass(configSuperClass);
 		enhancer.setInterfaces(new Class<?>[] {EnhancedConfiguration.class});
 		enhancer.setUseFactory(false);
 		enhancer.setNamingPolicy(SpringNamingPolicy.INSTANCE);
-		enhancer.setAttemptLoad(!isClassReloadable(configSuperClass, classLoader));
+		enhancer.setAttemptLoad(enhancer.getUseCache() && AotDetector.useGeneratedArtifacts());
 		enhancer.setStrategy(new BeanFactoryAwareGeneratorStrategy(classLoader));
 		enhancer.setCallbackFilter(CALLBACK_FILTER);
 		enhancer.setCallbackTypes(CALLBACK_FILTER.getCallbackTypes());
 		return enhancer;
-	}
-
-	/**
-	 * Checks whether the given configuration class is reloadable.
-	 */
-	private boolean isClassReloadable(Class<?> configSuperClass, @Nullable ClassLoader classLoader) {
-		return (classLoader instanceof SmartClassLoader smartClassLoader &&
-				smartClassLoader.isClassReloadable(configSuperClass));
 	}
 
 	/**
@@ -168,9 +190,9 @@ class ConfigurationClassEnhancer {
 		try {
 			subclass = enhancer.createClass();
 		}
-		catch (CodeGenerationException ex) {
+		catch (Throwable ex) {
 			if (!fallback) {
-				throw ex;
+				throw (ex instanceof CodeGenerationException cgex ? cgex : new CodeGenerationException(ex));
 			}
 			// Possibly a package-visible @Bean method declaration not accessible
 			// in the given ClassLoader -> retry with original ClassLoader
@@ -188,8 +210,7 @@ class ConfigurationClassEnhancer {
 	/**
 	 * Marker interface to be implemented by all @Configuration CGLIB subclasses.
 	 * Facilitates idempotent behavior for {@link ConfigurationClassEnhancer#enhance}
-	 * through checking to see if candidate classes are already assignable to it, for example,
-	 * have already been enhanced.
+	 * through checking to see if candidate classes are already assignable to it.
 	 * <p>Also extends {@link BeanFactoryAware}, as all enhanced {@code @Configuration}
 	 * classes require access to the {@link BeanFactory} that created them.
 	 * <p>Note that this interface is intended for framework-internal use only, however
@@ -341,9 +362,9 @@ class ConfigurationClassEnhancer {
 			// proxy that intercepts calls to getObject() and returns any cached bean instance.
 			// This ensures that the semantics of calling a FactoryBean from within @Bean methods
 			// is the same as that of referring to a FactoryBean within XML. See SPR-6602.
-			if (factoryContainsBean(beanFactory, BeanFactory.FACTORY_BEAN_PREFIX + beanName) &&
-					factoryContainsBean(beanFactory, beanName)) {
-				Object factoryBean = beanFactory.getBean(BeanFactory.FACTORY_BEAN_PREFIX + beanName);
+			String factoryBeanName = BeanFactory.FACTORY_BEAN_PREFIX + beanName;
+			if (factoryContainsBean(beanFactory, factoryBeanName) && factoryContainsBean(beanFactory, beanName)) {
+				Object factoryBean = beanFactory.getBean(factoryBeanName);
 				if (factoryBean instanceof ScopedProxyFactoryBean) {
 					// Scoped proxy factory beans are a special case and should not be further proxied
 				}
@@ -547,7 +568,7 @@ class ConfigurationClassEnhancer {
 			Enhancer enhancer = new Enhancer();
 			enhancer.setSuperclass(factoryBean.getClass());
 			enhancer.setNamingPolicy(SpringNamingPolicy.INSTANCE);
-			enhancer.setAttemptLoad(true);
+			enhancer.setAttemptLoad(AotDetector.useGeneratedArtifacts());
 			enhancer.setCallbackType(MethodInterceptor.class);
 
 			// Ideally create enhanced FactoryBean proxy without constructor side effects,
