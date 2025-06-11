@@ -333,6 +333,15 @@ public interface RestClient {
 		Builder defaultCookies(Consumer<MultiValueMap<String, String>> cookiesConsumer);
 
 		/**
+		 * Global option to specify an API version to be added to every request,
+		 * if not explicitly set.
+		 * @param version the version to use
+		 * @return this builder
+		 * @since 7.0
+		 */
+		Builder defaultApiVersion(Object version);
+
+		/**
 		 * Configure an {@link ApiVersionInserter} to abstract how an API version
 		 * specified via {@link RequestHeadersSpec#apiVersion(Object)}
 		 * is inserted into the request.
@@ -918,6 +927,17 @@ public interface RestClient {
 		 * @return this builder
 		 */
 		RequestBodySpec body(StreamingHttpOutputMessage.Body body);
+
+		/**
+		 * Set the hint with the given name to the given value for
+		 * {@link org.springframework.http.converter.SmartHttpMessageConverter}s
+		 * supporting them.
+		 * @param key the key of the hint to add
+		 * @param value the value of the hint to add
+		 * @return this builder
+		 * @since 7.0
+		 */
+		RequestBodySpec hint(String key, Object value);
 	}
 
 
@@ -1016,6 +1036,17 @@ public interface RestClient {
 		 * handling.
 		 */
 		ResponseEntity<Void> toBodilessEntity();
+
+		/**
+		 * Set the hint with the given name to the given value for
+		 * {@link org.springframework.http.converter.SmartHttpMessageConverter}s
+		 * supporting them.
+		 * @param key the key of the hint to add
+		 * @param value the value of the hint to add
+		 * @return this builder
+		 * @since 7.0
+		 */
+		ResponseSpec hint(String key, Object value);
 
 
 		/**

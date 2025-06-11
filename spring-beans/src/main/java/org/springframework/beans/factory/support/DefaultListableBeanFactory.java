@@ -162,7 +162,7 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 			new ConcurrentHashMap<>(8);
 
 	/** Whether strict locking is enforced or relaxed in this factory. */
-	private @Nullable final Boolean strictLocking = SpringProperties.checkFlag(STRICT_LOCKING_PROPERTY_NAME);
+	private final @Nullable Boolean strictLocking = SpringProperties.checkFlag(STRICT_LOCKING_PROPERTY_NAME);
 
 	/** Optional id for this factory, for serialization purposes. */
 	private @Nullable String serializationId;
@@ -211,9 +211,8 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 	/** Whether bean definition metadata may be cached for all beans. */
 	private volatile boolean configurationFrozen;
 
-	private volatile boolean preInstantiationPhase;
-
-	private @Nullable volatile String mainThreadPrefix;
+	/** Name prefix of main thread: only set during pre-instantiation phase. */
+	private volatile @Nullable String mainThreadPrefix;
 
 	private final NamedThreadLocal<PreInstantiation> preInstantiationThread =
 			new NamedThreadLocal<>("Pre-instantiation thread marker");
@@ -1048,11 +1047,14 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 
 	@Override
 	protected @Nullable Boolean isCurrentThreadAllowedToHoldSingletonLock() {
-		if (this.preInstantiationPhase) {
-			// We only differentiate in the preInstantiateSingletons phase.
+		String mainThreadPrefix = this.mainThreadPrefix;
+		if (mainThreadPrefix != null) {
+			// We only differentiate in the preInstantiateSingletons phase, using
+			// the volatile mainThreadPrefix field as an indicator for that phase.
+
 			PreInstantiation preInstantiation = this.preInstantiationThread.get();
 			if (preInstantiation != null) {
-				// A Spring-managed thread:
+				// A Spring-managed bootstrap thread:
 				// MAIN is allowed to lock (true) or even forced to lock (null),
 				// BACKGROUND is never allowed to lock (false).
 				return switch (preInstantiation) {
@@ -1060,14 +1062,23 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 					case BACKGROUND -> false;
 				};
 			}
-			if (Boolean.FALSE.equals(this.strictLocking) ||
-					(this.strictLocking == null && !getThreadNamePrefix().equals(this.mainThreadPrefix))) {
-				// An unmanaged thread (assumed to be application-internal) with lenient locking,
-				// and not part of the same thread pool that provided the main bootstrap thread
-				// (excluding scenarios where we are hit by multiple external bootstrap threads).
+
+			// Not a Spring-managed bootstrap thread...
+			if (Boolean.FALSE.equals(this.strictLocking)) {
+				// Explicitly configured to use lenient locking wherever possible.
 				return true;
 			}
+			else if (this.strictLocking == null) {
+				// No explicit locking configuration -> infer appropriate locking.
+				if (!getThreadNamePrefix().equals(mainThreadPrefix)) {
+					// An unmanaged thread (assumed to be application-internal) with lenient locking,
+					// and not part of the same thread pool that provided the main bootstrap thread
+					// (excluding scenarios where we are hit by multiple external bootstrap threads).
+					return true;
+				}
+			}
 		}
+
 		// Traditional behavior: forced to always hold a full lock.
 		return null;
 	}
@@ -1085,7 +1096,6 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 		// Trigger initialization of all non-lazy singleton beans...
 		List<CompletableFuture<?>> futures = new ArrayList<>();
 
-		this.preInstantiationPhase = true;
 		this.preInstantiationThread.set(PreInstantiation.MAIN);
 		this.mainThreadPrefix = getThreadNamePrefix();
 		try {
@@ -1102,7 +1112,6 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 		finally {
 			this.mainThreadPrefix = null;
 			this.preInstantiationThread.remove();
-			this.preInstantiationPhase = false;
 		}
 
 		if (!futures.isEmpty()) {
@@ -1727,7 +1736,6 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 			throw new BeanNotOfRequiredTypeException(name, type, candidate.getClass());
 		}
 		return result;
-
 	}
 
 	private @Nullable Object resolveMultipleBeans(DependencyDescriptor descriptor, @Nullable String beanName,
@@ -1959,7 +1967,7 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 		else if (containsSingleton(candidateName) ||
 				(descriptor instanceof StreamDependencyDescriptor streamDescriptor && streamDescriptor.isOrdered())) {
 			Object beanInstance = descriptor.resolveCandidate(candidateName, requiredType, this);
-			candidates.put(candidateName, (beanInstance instanceof NullBean ? null : beanInstance));
+			candidates.put(candidateName, beanInstance);
 		}
 		else {
 			candidates.put(candidateName, getType(candidateName));
@@ -2203,7 +2211,7 @@ public class DefaultListableBeanFactory extends AbstractAutowireCapableBeanFacto
 	 * i.e. whether the candidate points back to the original bean or to a factory method
 	 * on the original bean.
 	 */
-	@Contract("null, _ -> false;_, null -> false;")
+	@Contract("null, _ -> false; _, null -> false;")
 	private boolean isSelfReference(@Nullable String beanName, @Nullable String candidateName) {
 		return (beanName != null && candidateName != null &&
 				(beanName.equals(candidateName) || (containsBeanDefinition(candidateName) &&
